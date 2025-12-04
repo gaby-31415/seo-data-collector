@@ -170,34 +170,6 @@ def parse_sitemap_urls(xml_bytes: bytes, max_urls: int = 5000) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_url_list_text(raw_text: str, base_domain: str | None = None) -> pd.DataFrame:
-    """Parse newline/CSV URL list into DataFrame with columns url, lastmod(None).
-    Optionally filter to base_domain if provided."""
-    if not raw_text.strip():
-        return pd.DataFrame(columns=["url", "lastmod"])
-    tokens = re.split(r"[\n,]+", raw_text)
-    urls = []
-    for tkn in tokens:
-        u = tkn.strip().strip('"\'')
-        if not u:
-            continue
-        if not re.match(r"^https?://", u):
-            if u.startswith("//"):
-                u = "https:" + u
-            else:
-                if base_domain:
-                    u = base_domain.rstrip("/") + ("/" + u.lstrip("/"))
-                else:
-                    continue
-        urls.append(u)
-    df = pd.DataFrame({"url": urls, "lastmod": None})
-    if base_domain:
-        host = urlparse(base_domain).netloc
-        if host:
-            df = df[df["url"].apply(lambda x: urlparse(x).netloc == host)]
-    return df.reset_index(drop=True)
-
-
 def is_asset_url(u: str) -> bool:
     p = urlparse(u).path.lower()
     return any(p.endswith(ext) for ext in ASSET_EXTS)
@@ -501,13 +473,14 @@ except Exception:
 
 def choose_restaurant_name(candidates: list[str]) -> str | None:
     clean = []
+    seen = set()
     for c in candidates or []:
         c0 = re.sub(r"\s*[\|\-–—].*$", "", str(c)).strip()
-        if c0:
+        if c0 and c0 not in seen:
+            seen.add(c0)
             clean.append(c0)
     if not clean:
         return None
-    clean.sort(key=len)
     return clean[0]
 
 def best_description(desc_candidates: list[str]) -> str | None:
@@ -525,41 +498,129 @@ def normalize_path_to_bucket(path: str) -> str | None:
     return None
 
 def classify_urls_for_yaml(urls: list[str]) -> dict:
-    out = {
-        "homepage": "",
-        "menu": "",
-        "order_online": "",
-        "catering": "",
-        "private_events": "",
-        "private_dining": "",
-        "events": "",
-        "happy_hour": "",
-        "locations": "",
-        "about": "",
-        "contact": "",
-        "reservations": "",
-        "gift_cards": "",
-        "gallery": "",
-        "blog_or_press": "",
-        "other_relevant": []
+    label_map = {
+        "homepage": "Homepage",
+        "menu": "Menu",
+        "order_online": "Order Online",
+        "catering": "Catering Page",
+        "private_events": "Private Events",
+        "private_dining": "Private Dining",
+        "events": "Events",
+        "happy_hour": "Happy Hour",
+        "locations": "Locations",
+        "about": "About",
+        "contact": "Contact",
+        "reservations": "Reservations",
+        "gift_cards": "Gift Cards",
+        "gallery": "Gallery",
+        "blog_or_press": "Blog/Press",
     }
-    best: dict[str, tuple[str,int]] = {}
+    best: dict[str, tuple[str, int]] = {}
     for u in urls or []:
         if exclude_utility(u):
             continue
         cu = canonicalize_url(u)
         path = urlparse(cu).path or '/'
+        if any(hint in path.lower() for hint in ITEM_PATH_HINTS):
+            continue
         b = normalize_path_to_bucket(path)
         if b:
             plen = len(path)
             if b not in best or plen < best[b][1]:
                 best[b] = (cu, plen)
-        else:
-            out["other_relevant"].append(cu)
-    for k,(val,_) in best.items():
-        out[k] = val
-    out["other_relevant"] = sorted(list(dict.fromkeys(out["other_relevant"])))
+    out = {}
+    for bucket, (val, _) in best.items():
+        label = label_map.get(bucket, bucket.replace("_", " ").title())
+        out[label] = val
     return out
+
+
+def find_homepage_row(df: pd.DataFrame) -> pd.Series | None:
+    if df is None or df.empty:
+        return None
+
+    def path_for(u: str | None) -> str:
+        try:
+            return urlparse(u).path if pd.notna(u) else ""
+        except Exception:
+            return ""
+
+    df_tmp = df.copy()
+    df_tmp["__path"] = df_tmp["url"].apply(path_for)
+    home_rows = df_tmp[df_tmp["__path"].isin(["", "/"])]
+    if not home_rows.empty:
+        return home_rows.iloc[0]
+
+    df_tmp["__len"] = df_tmp["__path"].apply(lambda p: len(p or ""))
+    return df_tmp.sort_values("__len").iloc[0]
+
+
+def get_homepage_bytes(html_sources: list[tuple[str, bytes]], homepage_row: pd.Series | None) -> bytes | None:
+    src_name = homepage_row.get("source_file") if homepage_row is not None else None
+    html_map = {name: content for name, content in html_sources}
+    if src_name and src_name in html_map:
+        return html_map[src_name]
+
+    for name, content in html_sources:
+        if re.search(r"(index|home)\.(html?|htm)$", name, flags=re.IGNORECASE):
+            return content
+
+    return html_sources[0][1] if html_sources else None
+
+
+def extract_homepage_content(html_bytes: bytes | None) -> dict:
+    if not html_bytes:
+        return {"headings": [], "paragraphs": []}
+    try:
+        html_text = html_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        html_text = str(html_bytes)
+    soup = BeautifulSoup(html_text, "html.parser")
+    heads = [h.get_text(" ", strip=True) for h in soup.find_all(["h1", "h2", "h3"])]
+    paras = []
+    for p in soup.find_all("p"):
+        txt = p.get_text(" ", strip=True)
+        if txt and len(txt.split()) >= 3:
+            paras.append(txt)
+    return {"headings": heads, "paragraphs": paras}
+
+
+def extract_menu_offerings(html_sources: list[tuple[str, bytes]]) -> list[dict]:
+    offerings: list[dict] = []
+    seen = set()
+    for _, content in html_sources:
+        try:
+            html_text = content.decode("utf-8", errors="ignore")
+        except Exception:
+            html_text = str(content)
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        for tag in soup.find_all(attrs={"itemtype": re.compile("MenuItem", re.IGNORECASE)}):
+            name_tag = tag.find(attrs={"itemprop": "name"}) or tag.find(["h3", "h4", "h5", "strong"])
+            desc_tag = tag.find(attrs={"itemprop": "description"}) or tag.find("p")
+            name_txt = name_tag.get_text(" ", strip=True) if name_tag else ""
+            if not name_txt:
+                continue
+            desc_txt = desc_tag.get_text(" ", strip=True) if desc_tag else ""
+            key = (name_txt, desc_txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            offerings.append({"name": name_txt, "description": desc_txt})
+
+        for name_field in soup.find_all(attrs={"itemprop": "name"}):
+            name_txt = name_field.get_text(" ", strip=True)
+            if not name_txt:
+                continue
+            sibling_desc = name_field.find_next(attrs={"itemprop": "description"})
+            desc_txt = sibling_desc.get_text(" ", strip=True) if sibling_desc else ""
+            key = (name_txt, desc_txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            offerings.append({"name": name_txt, "description": desc_txt})
+
+    return offerings
 
 def extract_name_desc_offers_addresses(html_bytes: bytes) -> dict:
     try:
@@ -608,12 +669,14 @@ def extract_name_desc_offers_addresses(html_bytes: bytes) -> dict:
 
 def make_initial_yaml_packet(
     restaurant_name: str | None,
-    url_map: dict,
-    cuisine_terms: list[str],
-    signature_dishes: list[str],
     offerings: list[str],
     addresses: list[str],
-    description: str | None
+    core_urls: dict,
+    homepage_title: str | None,
+    meta_descriptions: dict,
+    homepage_content: dict,
+    description: str | None,
+    menu_offerings: list[dict],
 ):
     # Very light structuring of addresses
     locs = []
@@ -629,15 +692,15 @@ def make_initial_yaml_packet(
             locs.append({"label": a, "street": "", "city": "", "state": "", "postal_code": "", "country": ""})
 
     packet = {
-        "restaurant_name": restaurant_name or "",
-        "urls": url_map,
-        "dishes_cuisine_offerings": {
-            "cuisine": cuisine_terms,
-            "signature_dishes": signature_dishes,
-            "offerings": offerings
-        },
-        "locations": locs,
-        "short_description": description or ""
+        "Restaurant Name": restaurant_name or "",
+        "Offerings/Services": offerings,
+        "Locations": locs,
+        "Core URLs": core_urls,
+        "Current Homepage Title": homepage_title or "",
+        "Current Meta Descriptions": meta_descriptions,
+        "Current Homepage Content": homepage_content,
+        "Restaurant Description": description if description else None,
+        "Menu Offerings": menu_offerings,
     }
     return packet
 
@@ -856,8 +919,6 @@ st.caption("Upload sitemap.xml and HTML (.html/.htm) files or one .zip with HTML
 with st.sidebar:
     st.header("Uploads")
     sitemap_file = st.file_uploader("Sitemap (sitemap.xml)", type=["xml"])
-    raw_list = st.text_area("Or paste a raw list of URLs (newline/CSV)")
-    base_for_raw = st.text_input("Base domain (only for relative paths in pasted list)", value="")
     html_files = st.file_uploader(
         "HTML files (or a single .zip)", type=["html", "htm", "zip"], accept_multiple_files=True
     )
@@ -900,11 +961,6 @@ if run_btn:
         else:
             st.warning("Sitemap provided but no URLs found (index-only or malformed).")
 
-    if raw_list.strip():
-        raw_df = parse_url_list_text(raw_list, base_domain=base_for_raw or None)
-        if not raw_df.empty:
-            sitemap_urls = pd.concat([sitemap_urls, raw_df], ignore_index=True)
-
     if not sitemap_urls.empty:
         sitemap_urls["url"] = sitemap_urls["url"].apply(canonicalize_url)
         sitemap_urls = sitemap_urls.drop_duplicates(subset=["url"]).reset_index(drop=True)
@@ -944,7 +1000,7 @@ if run_btn:
             "text/plain",
         )
     else:
-        st.info("No eligible main pages detected from the provided URLs. Check filters or paste a raw list.")
+        st.info("No eligible main pages detected from the provided URLs. Check filters or sitemap inputs.")
 
     # Item/Dish keyword extraction
     st.subheader("🍽️ Dish Keywords (from item URLs)")
@@ -952,24 +1008,17 @@ if run_btn:
     kw = extract_item_keywords(sitemap_urls, sample_n=(None if sample_items == 0 else int(sample_items)))
 
     if kw["item_urls"]:
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Item/Dish URLs**")
-            st.code("\n".join(kw["item_urls"]))
-        with c2:
             st.markdown("**Dish Names (pretty)**")
             st.code("\n".join(kw["dish_names"]))
-        with c3:
+        with c2:
             st.markdown("**Generalized Dish Names**")
             st.code("\n".join(kw["generic_dish_names"]))
-        st.markdown("**Search-Behavior Keyword List**")
-        st.code("\n".join(kw["search_keywords"]))
 
         out = {
-            "item_urls": kw["item_urls"],
             "dish_names": kw["dish_names"],
             "generic_dish_names": kw["generic_dish_names"],
-            "search_keywords": kw["search_keywords"],
         }
         st.download_button(
             "Download Dish Keywords (JSON)",
@@ -1070,16 +1119,24 @@ if run_btn:
     # =========================================
     st.subheader("🧾 YAML: Restaurant Packet")
 
+    html_subset = html_sources[:cap]
+
     # Gather name/desc/addresses/offerings from uploaded HTML
-    name_cands, desc_cands, all_addresses, all_offers = [], [], [], []
-    for _, content in html_sources[:cap]:
+    name_cands_home, name_cands_other, desc_cands, all_addresses, all_offers = [], [], [], [], []
+    homepage_row = find_homepage_row(df)
+    homepage_bytes = get_homepage_bytes(html_subset, homepage_row)
+
+    for fname, content in html_subset:
         meta = extract_name_desc_offers_addresses(content)
-        name_cands.extend(meta["name_candidates"])
         desc_cands.extend(meta["desc_candidates"])
         all_addresses.extend(meta["addresses"])
         all_offers.extend(meta["offerings"])
+        if homepage_row is not None and fname == homepage_row.get("source_file"):
+            name_cands_home.extend(meta["name_candidates"])
+        else:
+            name_cands_other.extend(meta["name_candidates"])
 
-    restaurant_name = choose_restaurant_name(name_cands)
+    restaurant_name = choose_restaurant_name(name_cands_home + name_cands_other)
     description = best_description(desc_cands)
     offerings = sorted(list(dict.fromkeys(all_offers)))
     addresses = sorted(list(dict.fromkeys(all_addresses)))
@@ -1091,18 +1148,24 @@ if run_btn:
         url_list_for_map = df["url"].dropna().tolist()
     url_map = classify_urls_for_yaml(url_list_for_map)
 
-    # Cuisine terms & signature dishes from extracted item keywords
-    cuisine_terms = sorted(list(dict.fromkeys([w.title() for w in kw.get("search_keywords", [])])))
-    signature_dishes = kw.get("dish_names", [])[:10] if kw.get("dish_names") else []
+    homepage_title = homepage_row.get("title") if homepage_row is not None else None
+    meta_descriptions = {}
+    if homepage_row is not None and homepage_row.get("meta_description"):
+        meta_descriptions["Homepage"] = homepage_row.get("meta_description")
+
+    homepage_content = extract_homepage_content(homepage_bytes)
+    menu_offerings = extract_menu_offerings(html_subset)
 
     initial_packet = make_initial_yaml_packet(
         restaurant_name=restaurant_name,
-        url_map=url_map,
-        cuisine_terms=cuisine_terms,
-        signature_dishes=signature_dishes,
         offerings=offerings,
         addresses=addresses,
-        description=description
+        core_urls=url_map,
+        homepage_title=homepage_title,
+        meta_descriptions=meta_descriptions,
+        homepage_content=homepage_content,
+        description=description,
+        menu_offerings=menu_offerings,
     )
 
     yaml_text = dump_yaml(initial_packet)
